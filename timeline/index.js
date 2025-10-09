@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { DateTime } = require('luxon');
 const publicationsService = require('../services/publicationsService');
 const apiService = require('../services/apiService');
 const utils = require('../services/utilis');
@@ -279,59 +280,119 @@ router.post('/submit', utils.createIntercomMiddleware(), async (req, res) => {
 
       // Process events to show next available run dates
       if (limitedEvents.length > 0) {
-        // Sort events by start date
-        const sortedEvents = limitedEvents.sort((a, b) => {
-          const dateA = new Date(a.start.dateTime);
-          const dateB = new Date(b.start.dateTime);
-          return dateA - dateB;
-        });
+        // Helper function to convert timezone considering both EDT and EST
+        const getTimezoneAbbreviation = (timezone, date) => {
+          const dt = DateTime.fromJSDate(date).setZone(timezone);
+          return dt.offsetNameShort; // This will automatically return EDT or EST based on the date
+        };
 
-        // Show next few upcoming events (limit to 10 for UI purposes)
-        const upcomingEvents = sortedEvents.slice(0, 10);
-
-        upcomingEvents.forEach(event => {
-          const eventDate = new Date(event.start.dateTime);
+        // Helper function to generate next 5 occurrences starting from event start date
+        const generateNext5FromEvents = (events) => {
+          const dates = [];
           
-          // Format the run date (e.g., "Mon 9/29/25")
-          const dayNames = ['Sun', 'Mon', 'Tues', 'Wed', 'Thurs', 'Fri', 'Sat'];
-          const dayName = dayNames[eventDate.getDay()];
-          const month = eventDate.getMonth() + 1;
-          const day = eventDate.getDate();
-          const year = eventDate.getFullYear().toString().slice(-2);
-          const formattedRunDate = `${dayName} ${month}/${day}/${year}`;
-
-          // Calculate submission deadline (typically 2 days before run date)
-          const submissionDate = new Date(eventDate);
-          submissionDate.setDate(eventDate.getDate() - 2);
-          const subDayName = dayNames[submissionDate.getDay()];
-          const subMonth = submissionDate.getMonth() + 1;
-          const subDay = submissionDate.getDate();
-          const subYear = submissionDate.getFullYear().toString().slice(-2);
-          const formattedSubDate = `${subDayName} ${subMonth}/${subDay}/${subYear}`;
-
-          // Extract time from the event (default to 3:00pm if not specified)
-          const eventTime = new Date(event.start.dateTime);
-          const timeString = eventTime.toLocaleTimeString('en-US', { 
-            hour: 'numeric', 
-            minute: '2-digit', 
-            hour12: true 
+          // Get the start date from the first event (2025-10-06)
+          const eventStartDate = DateTime.fromISO(events[0].start.dateTime).setZone(events[0].start.timeZone);
+          
+          // Collect all recurring days from the events
+          const recurringDays = new Set();
+          const timezone = events[0].start.timeZone;
+          
+          events.forEach(event => {
+            if (event.recurrence && event.recurrence[0]) {
+              const rrule = event.recurrence[0];
+              const bydayMatch = rrule.match(/BYDAY=([^;]+)/);
+              if (bydayMatch) {
+                recurringDays.add(bydayMatch[1]);
+              }
+            }
           });
+          
+          console.log('Event start date:', eventStartDate.toISO());
+          console.log('Recurring days found:', Array.from(recurringDays));
+          
+          // Map RRULE day abbreviations to day indices (Luxon uses 1=Monday, 7=Sunday)
+          const dayMap = { 'MO': 1, 'TU': 2, 'WE': 3, 'TH': 4, 'FR': 5, 'SA': 6, 'SU': 7 };
+          
+          // Get current datetime in the event timezone
+          const now = DateTime.now().setZone(timezone);
+          
+          // Start from today or event start date, whichever is later
+          let currentDate = DateTime.max(now.startOf('day'), eventStartDate.startOf('day'));
+          let count = 0;
+          
+          while (count < 5) {
+            const weekday = currentDate.weekday; // Luxon weekday (1=Monday, 7=Sunday)
+            const dayAbbr = Object.keys(dayMap).find(key => dayMap[key] === weekday);
+            
+            if (recurringDays.has(dayAbbr)) {
+              // Create the run date at 12:00 PM in the event timezone
+              const runDate = currentDate.set({ hour: 12, minute: 0, second: 0, millisecond: 0 });
+              
+              // Calculate submission deadline (2 days before at 12:00 PM)
+              const submissionDate = runDate.minus({ days: 2 });
+              
+              // Only add if submission deadline is in the future (including time comparison)
+              if (submissionDate > now) {
+                const timezoneAbbr = getTimezoneAbbreviation(timezone, runDate.toJSDate());
+                
+                dates.push({
+                  runDate: runDate,
+                  submissionDate: submissionDate,
+                  timezone: timezone,
+                  timezoneAbbr: timezoneAbbr
+                });
+                
+                console.log(`✓ Added: Run ${runDate.toFormat('ccc M/d/yy h:mm a')}, Submit by ${submissionDate.toFormat('ccc M/d/yy h:mm a')}`);
+                count++;
+              } else {
+                console.log(`✗ Skipped: Run ${runDate.toFormat('ccc M/d/yy h:mm a')}, Submit by ${submissionDate.toFormat('ccc M/d/yy h:mm a')} (deadline passed)`);
+              }
+            }
+            currentDate = currentDate.plus({ days: 1 });
+          }
+          
+          return dates;
+        };
 
-          // Add run date header
-          components.push({
-            "type": "text",
-            "text": `*${formattedRunDate}*`,
-            "style": "muted",
-            "bottom_margin": "none"
-          });
+        // Helper function to format date using Luxon
+        const formatDate = (luxonDate) => {
+          return luxonDate.toFormat('ccc M/d/yy'); // e.g., "Mon 10/6/25"
+        };
 
-          // Add submission deadline
-          components.push({
-            "type": "text",
-            "text": `Submit by ${timeString} on ${formattedSubDate}`,
-            "style": "paragraph"
+        // Helper function to format time with timezone using Luxon
+        const formatTime = (luxonDate) => {
+          return luxonDate.toFormat('h:mm a'); // e.g., "12:00 PM"
+        };
+
+        // Process events - show next 5 occurrences based on actual calendar events
+        const processedDates = new Set(); // To avoid duplicates
+        
+        // Generate next 5 occurrences using actual calendar event data
+        if (limitedEvents.length > 0) {
+          const nextDates = generateNext5FromEvents(limitedEvents);
+          
+          nextDates.forEach(dateInfo => {
+            const dateKey = dateInfo.runDate.toISO(); // Use Luxon's toISO() instead of toDateString()
+            if (!processedDates.has(dateKey)) {
+              processedDates.add(dateKey);
+              
+              // Add run date header
+              components.push({
+                "type": "text",
+                "text": `*${formatDate(dateInfo.runDate)}*`,
+                "style": "muted",
+                "bottom_margin": "none"
+              });
+
+              // Add submission deadline with timezone
+              components.push({
+                "type": "text", 
+                "text": `Submit by ${formatTime(dateInfo.runDate)} ${dateInfo.timezoneAbbr} on ${formatDate(dateInfo.submissionDate)}`,
+                "style": "paragraph"
+              });
+            }
           });
-        });
+        }
       } else {
         // No events found
         components.push({

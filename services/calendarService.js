@@ -1,5 +1,6 @@
 const axios = require('axios');
 const NodeCache = require('node-cache');
+const { DateTime } = require('luxon');
 const path = require('path');
 
 class CalendarService {
@@ -62,10 +63,9 @@ class CalendarService {
       .join(' ');
     
     // Generate session ID for this run
-    const sessionId = new Date().toISOString().split('T')[0] + '_' + Date.now();
+    const sessionId = DateTime.now().toFormat('yyyy-MM-dd') + '_' + Date.now();
     
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = DateTime.now().startOf('day');
     
     const eventsByDayPattern = new Map();
     const lines = icsContent.split('\n').map(line => line.trim());
@@ -93,12 +93,15 @@ class CalendarService {
           
           // For recurring events, keep them even if the start date is in the past
           // For non-recurring events, only include if they're in the future
-          const eventStart = new Date(currentEvent.startDate);
-          if (!isRecurringEvent && eventStart < today) {
-            pastEvents++;
-            currentEvent = null;
-            inEvent = false;
-            continue;
+          if (!isRecurringEvent && currentEvent.startDate) {
+            const eventTimezone = currentEvent.startTimezone || 'America/New_York';
+            const todayInEventTz = today.setZone(eventTimezone);
+            if (currentEvent.startDate < todayInEventTz) {
+              pastEvents++;
+              currentEvent = null;
+              inEvent = false;
+              continue;
+            }
           }
           futureEvents++;
           
@@ -114,11 +117,13 @@ class CalendarService {
         
         // Handle common VEVENT properties
         if (property.startsWith('DTSTART')) {
-          currentEvent.startDate = this.parseIcsDate(value);
-          currentEvent.startTimezone = this.extractTimezone(line);
+          const timezone = this.extractTimezone(line);
+          currentEvent.startDate = this.parseIcsDate(value, timezone);
+          currentEvent.startTimezone = timezone;
         } else if (property.startsWith('DTEND')) {
-          currentEvent.endDate = this.parseIcsDate(value);
-          currentEvent.endTimezone = this.extractTimezone(line);
+          const timezone = this.extractTimezone(line);
+          currentEvent.endDate = this.parseIcsDate(value, timezone);
+          currentEvent.endTimezone = timezone;
         } else {
           switch (property) {
             case 'SUMMARY':
@@ -143,10 +148,10 @@ class CalendarService {
               currentEvent.categories = value;
               break;
             case 'CREATED':
-              currentEvent.created = this.parseIcsDate(value);
+              currentEvent.created = this.parseIcsDate(value, 'UTC');
               break;
             case 'LAST-MODIFIED':
-              currentEvent.lastModified = this.parseIcsDate(value);
+              currentEvent.lastModified = this.parseIcsDate(value, 'UTC');
               break;
             default:
               // Store other properties in a generic way
@@ -191,32 +196,36 @@ class CalendarService {
         .join(' ');
     }
     
-    let eventStartTime = new Date(currentEvent.startDate);
-    let eventEndTime = new Date(currentEvent.endDate || currentEvent.startDate);
+    let eventStartTime = currentEvent.startDate; // Already parsed with timezone
+    let eventEndTime = currentEvent.endDate || currentEvent.startDate;
+    const eventTimezone = currentEvent.startTimezone || 'America/New_York';
+    
+    // Convert today to the event's timezone for proper comparison
+    const todayInEventTz = today.setZone(eventTimezone);
     
     // If this is a recurring event with a past start date, adjust to the next future occurrence
-    if (isRecurringEvent && eventStartTime < today) {
-      const eventDayOfWeek = eventStartTime.getDay();
-      const todayDayOfWeek = today.getDay();
+    if (isRecurringEvent && eventStartTime < todayInEventTz) {
+      const eventDayOfWeek = eventStartTime.weekday; // Luxon weekday (1=Monday, 7=Sunday)
+      const todayDayOfWeek = todayInEventTz.weekday;
       
       // Calculate days until the next occurrence of this day of week
       let daysToAdd = (eventDayOfWeek - todayDayOfWeek + 7) % 7;
       if (daysToAdd === 0) daysToAdd = 7; // If it's the same day, move to next week
       
-      const nextOccurrence = new Date(today);
-      nextOccurrence.setDate(today.getDate() + daysToAdd);
-      nextOccurrence.setHours(eventStartTime.getHours());
-      nextOccurrence.setMinutes(eventStartTime.getMinutes());
-      nextOccurrence.setSeconds(eventStartTime.getSeconds());
+      const nextOccurrence = todayInEventTz.plus({ days: daysToAdd }).set({
+        hour: eventStartTime.hour,
+        minute: eventStartTime.minute,
+        second: eventStartTime.second
+      });
       
-      const duration = eventEndTime.getTime() - eventStartTime.getTime();
-      const nextEndTime = new Date(nextOccurrence.getTime() + duration);
+      const duration = eventEndTime.diff(eventStartTime);
+      const nextEndTime = nextOccurrence.plus(duration);
       
       eventStartTime = nextOccurrence;
       eventEndTime = nextEndTime;
     }
     
-    const timeKey = `${eventStartTime.getHours()}:${eventStartTime.getMinutes().toString().padStart(2, '0')}`;
+    const timeKey = `${eventStartTime.hour}:${eventStartTime.minute.toString().padStart(2, '0')}`;
     const baseUid = currentEvent.uid ? currentEvent.uid.split('--')[0] : '';
     
     // If this is a recurring event, create separate events for each day in the RRULE
@@ -233,7 +242,7 @@ class CalendarService {
       
       // If no BYDAY found, default to just this event's day
       if (daysInRule.length === 0) {
-        daysInRule = [dayNames[eventStartTime.getDay()]];
+        daysInRule = [dayNames[eventStartTime.weekday === 7 ? 0 : eventStartTime.weekday]]; // Convert Luxon weekday to JS weekday
       }
       
       // Create a recurring event for each day in the rule
@@ -250,12 +259,12 @@ class CalendarService {
             summary: currentEvent.summary || 'Untitled Event',
             description: `${currentEvent.description || ''}\n\nSource: ${eventSource}\noriginalUuid: ${currentEvent.uid}\nsessionId: ${sessionId}`,
             start: {
-              dateTime: eventStartTime.toISOString().replace('.000Z', '.000Z'),
-              timeZone: currentEvent.startTimezone || 'America/New_York'
+              dateTime: eventStartTime.toISO(),
+              timeZone: eventTimezone
             },
             end: {
-              dateTime: eventEndTime.toISOString().replace('.000Z', '.000Z'),
-              timeZone: currentEvent.endTimezone || currentEvent.startTimezone || 'America/New_York'
+              dateTime: eventEndTime.toISO(),
+              timeZone: currentEvent.endTimezone || eventTimezone
             },
             recurrence: [singleDayRrule],
             source: eventSource,
@@ -263,8 +272,8 @@ class CalendarService {
             sessionId: sessionId,
             isRecurring: true,
             // Legacy fields for backward compatibility
-            startDate: eventStartTime,
-            endDate: eventEndTime,
+            startDate: eventStartTime.toISO(),
+            endDate: eventEndTime.toISO(),
             uid: currentEvent.uid
           };
           
@@ -273,26 +282,26 @@ class CalendarService {
       }
     } else {
       // For non-recurring events, create a unique key and add them directly
-      const oneTimeKey = `${currentEvent.uid}_${eventStartTime.getTime()}`;
+      const oneTimeKey = `${currentEvent.uid}_${eventStartTime.toMillis()}`;
       if (!eventsByDayPattern.has(oneTimeKey)) {
         const parsedEvent = {
           summary: currentEvent.summary || 'Untitled Event',
           description: `${currentEvent.description || ''}\n\nSource: ${eventSource}\noriginalUuid: ${currentEvent.uid}\nsessionId: ${sessionId}`,
           start: {
-            dateTime: eventStartTime.toISOString().replace('.000Z', '.000Z'),
-            timeZone: currentEvent.startTimezone || 'America/New_York'
+            dateTime: eventStartTime.toISO(),
+            timeZone: eventTimezone
           },
           end: {
-            dateTime: eventEndTime.toISOString().replace('.000Z', '.000Z'),
-            timeZone: currentEvent.endTimezone || currentEvent.startTimezone || 'America/New_York'
+            dateTime: eventEndTime.toISO(),
+            timeZone: currentEvent.endTimezone || eventTimezone
           },
           source: eventSource,
           originalUid: currentEvent.uid,
           sessionId: sessionId,
           isRecurring: false,
           // Legacy fields for backward compatibility
-          startDate: eventStartTime,
-          endDate: eventEndTime,
+          startDate: eventStartTime.toISO(),
+          endDate: eventEndTime.toISO(),
           uid: currentEvent.uid
         };
         
@@ -313,18 +322,26 @@ class CalendarService {
   }
 
   /**
-   * Parse ICS date format to JavaScript Date
+   * Parse ICS date format to Luxon DateTime
    * @param {string} icsDate - Date in ICS format (YYYYMMDDTHHMMSSZ)
-   * @returns {Date} Parsed Date object
+   * @param {string} timezone - Timezone to use for parsing (defaults to extracted timezone)
+   * @returns {DateTime} Parsed Luxon DateTime object
    */
-  parseIcsDate(icsDate) {
+  parseIcsDate(icsDate, timezone = null) {
     try {
+      // Determine the timezone to use
+      let zone = timezone;
+      if (!zone) {
+        // If no timezone provided, determine from the date format
+        zone = icsDate.endsWith('Z') ? 'UTC' : 'America/New_York';
+      }
+      
       // Handle basic YYYYMMDD format
       if (icsDate.length === 8) {
         const year = parseInt(icsDate.substring(0, 4));
-        const month = parseInt(icsDate.substring(4, 6)) - 1; // Month is 0-indexed
+        const month = parseInt(icsDate.substring(4, 6));
         const day = parseInt(icsDate.substring(6, 8));
-        return new Date(year, month, day);
+        return DateTime.fromObject({ year, month, day }, { zone });
       }
       
       // Handle YYYYMMDDTHHMMSSZ format
@@ -334,19 +351,23 @@ class CalendarService {
         const timePart = dateTimeParts[1] || '000000';
         
         const year = parseInt(datePart.substring(0, 4));
-        const month = parseInt(datePart.substring(4, 6)) - 1;
+        const month = parseInt(datePart.substring(4, 6));
         const day = parseInt(datePart.substring(6, 8));
         const hour = parseInt(timePart.substring(0, 2));
         const minute = parseInt(timePart.substring(2, 4));
         const second = parseInt(timePart.substring(4, 6));
         
-        return new Date(Date.UTC(year, month, day, hour, minute, second));
+        // If original date ends with Z, it's UTC regardless of timezone parameter
+        const finalZone = icsDate.endsWith('Z') ? 'UTC' : zone;
+        return DateTime.fromObject({ year, month, day, hour, minute, second }, { zone: finalZone });
       }
       
-      return new Date(icsDate);
+      // Fallback: try to parse with Luxon's fromISO
+      const parsed = DateTime.fromISO(icsDate);
+      return timezone ? parsed.setZone(timezone) : parsed;
     } catch (error) {
       console.error('Error parsing ICS date:', icsDate, error.message);
-      return new Date();
+      return DateTime.now().setZone(timezone || 'America/New_York'); // Return current time as fallback
     }
   }
 
@@ -377,7 +398,7 @@ class CalendarService {
         url: icsUrl,
         events: events,
         eventCount: events.length,
-        fetchedAt: new Date(),
+        fetchedAt: DateTime.now().toISO(),
         rawContent: response.data,
         // Enhanced summary data
         recurringEvents: events.filter(e => e.isRecurring).length,
@@ -395,9 +416,9 @@ class CalendarService {
         console.log(`\nUpcoming events:`);
         
         events.slice(0, 5).forEach((event, index) => {
-          const startDate = new Date(event.start.dateTime);
+          const startDate = DateTime.fromISO(event.start.dateTime);
           const recurringText = event.isRecurring ? ' [RECURRING]' : '';
-          console.log(`  ${index + 1}. ${event.summary} - ${startDate.toLocaleDateString()}${recurringText}`);
+          console.log(`  ${index + 1}. ${event.summary} - ${startDate.toLocaleString(DateTime.DATE_SHORT)}${recurringText}`);
         });
         
         if (events.length > 5) {
@@ -534,8 +555,10 @@ class CalendarService {
     return calendarData.events.filter(event => {
       if (!event.startDate) return false;
       
-      const eventStart = new Date(event.startDate);
-      return eventStart >= startDate && eventStart <= endDate;
+      const eventStart = DateTime.fromISO(event.startDate);
+      const rangeStart = DateTime.fromJSDate(startDate);
+      const rangeEnd = DateTime.fromJSDate(endDate);
+      return eventStart >= rangeStart && eventStart <= rangeEnd;
     });
   }
 }
