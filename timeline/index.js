@@ -293,8 +293,9 @@ router.post('/submit', utils.createIntercomMiddleware(), async (req, res) => {
           // Get the start date from the first event (2025-10-06)
           const eventStartDate = DateTime.fromISO(events[0].start.dateTime).setZone(events[0].start.timeZone);
           
-          // Collect all recurring days from the events
+          // Collect all recurring days from the events and their deadline offsets
           const recurringDays = new Set();
+          const dayToDeadlineOffset = new Map(); // Map day abbreviations to their deadline offsets
           const timezone = events[0].start.timeZone;
           
           events.forEach(event => {
@@ -302,13 +303,18 @@ router.post('/submit', utils.createIntercomMiddleware(), async (req, res) => {
               const rrule = event.recurrence[0];
               const bydayMatch = rrule.match(/BYDAY=([^;]+)/);
               if (bydayMatch) {
-                recurringDays.add(bydayMatch[1]);
+                const dayAbbr = bydayMatch[1];
+                recurringDays.add(dayAbbr);
+                // Store the deadline offset for this day (default to 2 if not specified)
+                const deadlineOffset = event.deadlineOffset !== undefined ? event.deadlineOffset : 2;
+                dayToDeadlineOffset.set(dayAbbr, deadlineOffset);
               }
             }
           });
           
           console.log('Event start date:', eventStartDate.toISO());
           console.log('Recurring days found:', Array.from(recurringDays));
+          console.log('Deadline offsets:', Array.from(dayToDeadlineOffset.entries()));
           
           // Map RRULE day abbreviations to day indices (Luxon uses 1=Monday, 7=Sunday)
           const dayMap = { 'MO': 1, 'TU': 2, 'WE': 3, 'TH': 4, 'FR': 5, 'SA': 6, 'SU': 7 };
@@ -328,8 +334,13 @@ router.post('/submit', utils.createIntercomMiddleware(), async (req, res) => {
               // Create the run date at 12:00 PM in the event timezone
               const runDate = currentDate.set({ hour: 12, minute: 0, second: 0, millisecond: 0 });
               
-              // Calculate submission deadline (2 days before at 12:00 PM)
-              const submissionDate = runDate.minus({ days: 2 });
+              // Get the deadline offset for this specific day (check for undefined, not falsy, since 0 is valid)
+              const offsetValue = dayToDeadlineOffset.get(dayAbbr);
+              const deadlineOffset = offsetValue !== undefined ? offsetValue : 2;
+              
+              // Calculate submission deadline using the offset from X-PUB-DEADLINE-OFFSET
+              // If offset is 0, submission deadline is the same day as run date
+              const submissionDate = runDate.minus({ days: deadlineOffset });
               
               // Only add if submission deadline is in the future (including time comparison)
               if (submissionDate > now) {
@@ -339,13 +350,14 @@ router.post('/submit', utils.createIntercomMiddleware(), async (req, res) => {
                   runDate: runDate,
                   submissionDate: submissionDate,
                   timezone: timezone,
-                  timezoneAbbr: timezoneAbbr
+                  timezoneAbbr: timezoneAbbr,
+                  deadlineOffset: deadlineOffset
                 });
                 
-                console.log(`✓ Added: Run ${runDate.toFormat('ccc M/d/yy h:mm a')}, Submit by ${submissionDate.toFormat('ccc M/d/yy h:mm a')}`);
+                console.log(`✓ Added: Run ${runDate.toFormat('ccc M/d/yy h:mm a')}, Submit by ${submissionDate.toFormat('ccc M/d/yy h:mm a')} (offset: ${deadlineOffset} days)`);
                 count++;
               } else {
-                console.log(`✗ Skipped: Run ${runDate.toFormat('ccc M/d/yy h:mm a')}, Submit by ${submissionDate.toFormat('ccc M/d/yy h:mm a')} (deadline passed)`);
+                console.log(`✗ Skipped: Run ${runDate.toFormat('ccc M/d/yy h:mm a')}, Submit by ${submissionDate.toFormat('ccc M/d/yy h:mm a')} (deadline passed, offset: ${deadlineOffset} days)`);
               }
             }
             currentDate = currentDate.plus({ days: 1 });
@@ -387,7 +399,7 @@ router.post('/submit', utils.createIntercomMiddleware(), async (req, res) => {
               // Add submission deadline with timezone
               components.push({
                 "type": "text", 
-                "text": `Submit by ${formatTime(dateInfo.runDate)} ${dateInfo.timezoneAbbr} on ${formatDate(dateInfo.submissionDate)}`,
+                "text": `Submit by ${formatTime(dateInfo.submissionDate)} ${dateInfo.timezoneAbbr} on ${formatDate(dateInfo.submissionDate)}`,
                 "style": "paragraph"
               });
             }

@@ -153,6 +153,10 @@ class CalendarService {
             case 'LAST-MODIFIED':
               currentEvent.lastModified = this.parseIcsDate(value, 'UTC');
               break;
+            case 'X-PUB-DEADLINE-OFFSET':
+              // Parse the deadline offset (number of days from run date to submission deadline)
+              currentEvent.deadlineOffset = parseInt(value) || 0;
+              break;
             default:
               // Store other properties in a generic way
               if (!currentEvent.otherProperties) {
@@ -271,6 +275,7 @@ class CalendarService {
             originalUid: currentEvent.uid,
             sessionId: sessionId,
             isRecurring: true,
+            deadlineOffset: currentEvent.deadlineOffset !== undefined ? currentEvent.deadlineOffset : 2, // Default to 2 days if not specified
             // Legacy fields for backward compatibility
             startDate: eventStartTime.toISO(),
             endDate: eventEndTime.toISO(),
@@ -299,6 +304,7 @@ class CalendarService {
           originalUid: currentEvent.uid,
           sessionId: sessionId,
           isRecurring: false,
+          deadlineOffset: currentEvent.deadlineOffset !== undefined ? currentEvent.deadlineOffset : 2, // Default to 2 days if not specified
           // Legacy fields for backward compatibility
           startDate: eventStartTime.toISO(),
           endDate: eventEndTime.toISO(),
